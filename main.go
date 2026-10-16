@@ -1,26 +1,12 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
 )
-
-// errorResponse is fetchd's own error envelope. Upstream bodies stream as-is.
-type errorResponse struct {
-	Error   string `json:"error"`
-	Message string `json:"message"`
-}
-
-// writeError renders a fetchd-side failure as JSON.
-func writeError(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(errorResponse{Error: code, Message: message})
-}
 
 // Server wires routes to a Config.
 type Server struct {
