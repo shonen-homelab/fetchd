@@ -29,7 +29,8 @@ jobs:
         run: go test -race ./...
 
   image:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Dockerfile lands in PR5; skip until then so main stays green.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('Dockerfile') != ''
     needs: check
     runs-on: ubuntu-latest
     permissions:
