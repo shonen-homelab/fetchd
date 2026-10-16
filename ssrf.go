@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -9,11 +10,23 @@ import (
 	"time"
 )
 
+var errNoAddress = errors.New("no addresses returned")
+
 // ssrfBlockedError marks dials refused by the SSRF guard. The handler maps
 // these to 403; everything else from the transport is 502/504.
 type ssrfBlockedError struct{ reason string }
 
 func (e *ssrfBlockedError) Error() string { return "blocked target: " + e.reason }
+
+// dnsError marks resolution failure: not a policy block, so the handler maps
+// it to 502 upstream-unreachable (retryable like other connection errors).
+type dnsError struct {
+	host string
+	err  error
+}
+
+func (e *dnsError) Error() string { return fmt.Sprintf("dns resolve %q: %v", e.host, e.err) }
+func (e *dnsError) Unwrap() error { return e.err }
 
 // blockedPrefixes are never dialed unless FETCHD_ALLOW_PRIVATE=true.
 var blockedPrefixes = []netip.Prefix{
@@ -34,6 +47,8 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("fe80::/10"),     // link-local
 	netip.MustParsePrefix("ff00::/8"),      // multicast
 	netip.MustParsePrefix("2001:db8::/32"), // documentation
+	netip.MustParsePrefix("64:ff9b::/96"),  // NAT64 (embeds IPv4)
+	netip.MustParsePrefix("2002::/16"),     // 6to4 (embeds IPv4)
 }
 
 // ipBlocked reports whether an address must never be dialed.
@@ -72,10 +87,12 @@ func resolveIPs(ctx context.Context, host string) ([]netip.Addr, error) {
 // Resolution happens inside the guard and dials go to the checked IPs, so
 // redirects and DNS rebinding between check and dial are covered. The same
 // dialer serves every request, including redirect follow-ups.
-func guardedDialer(allowPrivate bool, timeout time.Duration) func(context.Context, string, string) (net.Conn, error) {
+// allowPrivate is a predicate (not a bool) so the shared Transport always
+// honors the server's current setting.
+func guardedDialer(allowPrivate func() bool, timeout time.Duration) func(context.Context, string, string) (net.Conn, error) {
 	base := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		if allowPrivate {
+		if allowPrivate() {
 			return base.DialContext(ctx, network, address)
 		}
 		if network != "tcp" && network != "tcp4" && network != "tcp6" {
@@ -86,8 +103,12 @@ func guardedDialer(allowPrivate bool, timeout time.Duration) func(context.Contex
 			return nil, &ssrfBlockedError{reason: "invalid address"}
 		}
 		ips, err := resolveIPs(ctx, host)
-		if err != nil || len(ips) == 0 {
-			return nil, &ssrfBlockedError{reason: fmt.Sprintf("host %q does not resolve", host)}
+		if err != nil {
+			// DNS failure is not a policy block: upstream-unreachable (502, retryable).
+			return nil, &dnsError{host: host, err: err}
+		}
+		if len(ips) == 0 {
+			return nil, &dnsError{host: host, err: errNoAddress}
 		}
 		var filtered []netip.Addr
 		for _, ip := range ips {

@@ -2,10 +2,13 @@ package main
 
 import (
 	"compress/gzip"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -95,6 +98,37 @@ func TestFetchPassthrough(t *testing.T) {
 	}
 }
 
+func TestUpstreamConnectionReuse(t *testing.T) {
+	srv := testServer(nil)
+	srv.cfg.AllowPrivate = true
+	var mu sync.Mutex
+	conns := 0
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			mu.Lock()
+			conns++
+			mu.Unlock()
+		}
+	}
+	upstream.Start()
+	defer upstream.Close()
+
+	for range 3 {
+		rec := doFetch(t, srv, http.MethodGet, upstream.URL, authHeaders())
+		if rec.Code != 200 {
+			t.Fatalf("got %d (%s)", rec.Code, rec.Body.String())
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if conns != 1 {
+		t.Fatalf("upstream connections: %d want 1 (shared transport must reuse)", conns)
+	}
+}
+
 func TestFetchBadURLAndScheme(t *testing.T) {
 	srv := testServer(nil)
 	for _, target := range []string{"ftp://example.com/x", "notaurl", ""} {
@@ -130,6 +164,35 @@ func TestSSRFBlockedByDefault(t *testing.T) {
 	rec = doFetch(t, srv, http.MethodGet, "http://127.0.0.1:9/", authHeaders())
 	if rec.Code != 403 {
 		t.Fatalf("loopback: got %d want 403", rec.Code)
+	}
+}
+
+func TestDNSFailureIs502AndRetried(t *testing.T) {
+	srv := testServer(nil)
+	var sleeps []time.Duration
+	fastRetry(srv, &sleeps)
+	// .invalid never resolves (RFC 2606): fast, no network needed.
+	rec := doFetch(t, srv, http.MethodGet, "http://nonexistent.invalid/", authHeaders())
+	if rec.Code != 502 {
+		t.Fatalf("got %d want 502 (%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_error") {
+		t.Fatalf("body: %s", rec.Body.String())
+	}
+	if len(sleeps) == 0 {
+		t.Fatal("DNS failure should be retryable")
+	}
+}
+
+func TestNAT64And6to4Blocked(t *testing.T) {
+	for _, ip := range []string{"64:ff9b::7f00:1", "2002:7f00:1::1"} {
+		addr, err := netip.ParseAddr(ip)
+		if err != nil {
+			t.Fatalf("parse %s: %v", ip, err)
+		}
+		if !ipBlocked(addr) {
+			t.Errorf("%s should be blocked", ip)
+		}
 	}
 }
 

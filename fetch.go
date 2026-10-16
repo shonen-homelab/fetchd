@@ -62,6 +62,14 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 // NewServer builds routes.
 func NewServer(cfg Config, log *slog.Logger) *Server {
 	s := &Server{cfg: cfg, mux: http.NewServeMux(), log: log, gate: newGate(cfg), retry: retryPolicyFromConfig(cfg)}
+	s.transport = &http.Transport{
+		DialContext:         guardedDialer(func() bool { return s.cfg.AllowPrivate }, cfg.Timeout),
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /fetch", s.requireAuth(s.handleFetchGet))
 	s.mux.HandleFunc("POST /fetch", s.requireAuth(s.handleFetchPost))
@@ -70,23 +78,18 @@ func NewServer(cfg Config, log *slog.Logger) *Server {
 
 // retryPolicy returns the server's policy (tests override sleep/jitter).
 func (s *Server) retryPolicy() retryPolicy { return s.retry }
-func (s *Server) clientFor(timeout time.Duration) *http.Client {
-	transport := &http.Transport{
-		DialContext:           guardedDialer(s.cfg.AllowPrivate, timeout),
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          64,
-		MaxIdleConnsPerHost:   8,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: timeout,
-	}
+
+// clientFor builds a lightweight client over the shared Transport.
+// Per-request timeouts come from the request context (ResponseHeaderTimeout
+// uses the configured default); nothing here allocates connections.
+func (s *Server) clientFor() *http.Client {
 	checkRedirect := func(_ *http.Request, via []*http.Request) error {
 		if uint(len(via)) >= s.cfg.MaxRedirects {
 			return http.ErrUseLastResponse
 		}
 		return nil
 	}
-	return &http.Client{Transport: transport, CheckRedirect: checkRedirect}
+	return &http.Client{Transport: s.transport, CheckRedirect: checkRedirect}
 }
 
 func (s *Server) handleFetchGet(w http.ResponseWriter, r *http.Request) {
@@ -167,7 +170,7 @@ func (s *Server) serveFetch(w http.ResponseWriter, r *http.Request, req fetchReq
 	defer cancel()
 
 	policy := s.retryPolicy()
-	client := s.clientFor(timeout)
+	client := s.clientFor()
 	var resp *http.Response
 	var err error
 	var lastErr error

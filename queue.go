@@ -54,6 +54,11 @@ func newGate(cfg Config) *gate {
 //   - full=true: queue full; caller responds 429 with Retry-After.
 //   - ok=false, full=false: queue timeout (caller responds 503) or client
 //     cancellation (caller just returns).
+//
+// Fairness: waiters already queued for a host beat newcomers for that host,
+// so a steady stream of arrivals cannot starve a waiter indefinitely.
+// There is no strict FIFO across hosts or across waiters waking together;
+// waiters re-poll on a short tick and compete evenly.
 func (g *gate) acquire(ctx context.Context, host string) (release func(), ok bool, full bool) {
 	host = normalizeHost(host)
 	var timer *time.Timer
@@ -64,10 +69,13 @@ func (g *gate) acquire(ctx context.Context, host string) (release func(), ok boo
 		timerCh = timer.C
 	}
 
+	queued := false
 	for {
 		g.mu.Lock()
 		slot := g.slotLocked(host)
-		if g.admittableLocked(slot) {
+		// First pass is a newcomer: yield to waiters already queued for
+		// this host. Later passes are a waiter competing evenly.
+		if (queued || slot.waiters == 0) && g.admittableLocked(slot) {
 			now := time.Now()
 			g.inflight++
 			slot.inflight++
@@ -82,6 +90,7 @@ func (g *gate) acquire(ctx context.Context, host string) (release func(), ok boo
 		}
 		g.waiting++
 		slot.waiters++
+		queued = true
 		wait := time.Until(slot.next)
 		g.mu.Unlock()
 

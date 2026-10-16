@@ -17,6 +17,8 @@ type Server struct {
 	log   *slog.Logger
 	gate  *gate
 	retry retryPolicy
+	// transport is shared by every request so keep-alive connections reuse.
+	transport *http.Transport
 }
 
 // NewServer lives in fetch.go.
