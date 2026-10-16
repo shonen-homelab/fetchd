@@ -55,6 +55,7 @@ func newGate(cfg Config) *gate {
 //   - ok=false, full=false: queue timeout (caller responds 503) or client
 //     cancellation (caller just returns).
 func (g *gate) acquire(ctx context.Context, host string) (release func(), ok bool, full bool) {
+	host = normalizeHost(host)
 	var timer *time.Timer
 	var timerCh <-chan time.Time
 	if g.queueTimeout > 0 {
