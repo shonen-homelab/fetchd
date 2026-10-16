@@ -194,6 +194,61 @@ func TestHostSlotsPruned(t *testing.T) {
 	}
 }
 
+func TestWaiterNotStarvedByNewcomers(t *testing.T) {
+	srv := gateTestServer(t, map[string]string{
+		"FETCHD_MAX_CONCURRENCY":      "1",
+		"FETCHD_MAX_QUEUE":            "64",
+		"FETCHD_QUEUE_TIMEOUT":        "10s",
+		"FETCHD_PER_HOST_CONCURRENCY": "1",
+		"FETCHD_PER_HOST_INTERVAL":    "0s",
+	})
+	holder, ok, _ := srv.gate.acquire(context.Background(), "churn.example")
+	if !ok {
+		t.Fatal("setup acquire failed")
+	}
+	waiterDone := make(chan struct{})
+	go func() {
+		defer close(waiterDone)
+		rel, ok, full := srv.gate.acquire(context.Background(), "churn.example")
+		if !ok || full {
+			t.Errorf("waiter: ok=%v full=%v", ok, full)
+			return
+		}
+		rel()
+	}()
+	// Let the waiter queue up, then churn newcomers for the same host.
+	time.Sleep(50 * time.Millisecond)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					rel, ok, _ := srv.gate.acquire(context.Background(), "churn.example")
+					if ok {
+						time.Sleep(time.Millisecond)
+						rel()
+					}
+				}
+			}
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	holder() // free the slot; waiter must win over churning newcomers
+	select {
+	case <-waiterDone:
+	case <-time.After(8 * time.Second):
+		t.Fatal("waiter starved by newcomers")
+	}
+	close(stop)
+	wg.Wait()
+}
+
 func TestQueueConcurrencyEndToEnd(t *testing.T) {
 	srv := gateTestServer(t, map[string]string{
 		"FETCHD_MAX_CONCURRENCY":      "2",

@@ -75,6 +75,9 @@ JSON `{"error":code,"message"}`:
 | `FETCHD_RETRY_MAX_DELAY` | `30s` | backoff cap |
 | `FETCHD_MAX_RETRY_WAIT` | `60s` | total wait budget; upstream `Retry-After` honored within it |
 
+Queue fairness: waiters already queued for a host beat newcomers for that
+host (no starvation); there is no strict FIFO across hosts.
+
 ## Compose
 
 ```yaml
