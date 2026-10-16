@@ -10,9 +10,10 @@ import (
 
 // Server wires routes to a Config.
 type Server struct {
-	cfg Config
-	mux *http.ServeMux
-	log *slog.Logger
+	cfg  Config
+	mux  *http.ServeMux
+	log  *slog.Logger
+	gate *gate
 }
 
 // NewServer lives in fetch.go.

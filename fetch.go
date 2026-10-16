@@ -61,7 +61,7 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 
 // NewServer builds routes.
 func NewServer(cfg Config, log *slog.Logger) *Server {
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), log: log}
+	s := &Server{cfg: cfg, mux: http.NewServeMux(), log: log, gate: newGate(cfg)}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /fetch", s.requireAuth(s.handleFetchGet))
 	s.mux.HandleFunc("POST /fetch", s.requireAuth(s.handleFetchPost))
@@ -139,6 +139,19 @@ func (s *Server) serveFetch(w http.ResponseWriter, r *http.Request, req fetchReq
 		return
 	}
 
+	release, ok, full := s.gate.acquire(r.Context(), target.Hostname())
+	if !ok {
+		if full {
+			w.Header().Set("Retry-After", "1")
+			writeError(w, http.StatusTooManyRequests, errQueueFull, "server busy, try again shortly")
+		} else if r.Context().Err() != nil {
+			return // client gone; connection teardown is the signal
+		} else {
+			writeError(w, http.StatusServiceUnavailable, errQueueTimeout, "timed out waiting for capacity")
+		}
+		return
+	}
+	defer release()
 	timeout := s.cfg.Timeout
 	if req.TimeoutMs != nil {
 		if *req.TimeoutMs <= 0 {
