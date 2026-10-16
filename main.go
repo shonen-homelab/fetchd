@@ -15,12 +15,7 @@ type Server struct {
 	log *slog.Logger
 }
 
-// NewServer builds routes. Fetch endpoints arrive in PR2.
-func NewServer(cfg Config, log *slog.Logger) *Server {
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), log: log}
-	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
-	return s
-}
+// NewServer lives in fetch.go.
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
