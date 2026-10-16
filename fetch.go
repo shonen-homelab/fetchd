@@ -61,13 +61,15 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 
 // NewServer builds routes.
 func NewServer(cfg Config, log *slog.Logger) *Server {
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), log: log, gate: newGate(cfg)}
+	s := &Server{cfg: cfg, mux: http.NewServeMux(), log: log, gate: newGate(cfg), retry: retryPolicyFromConfig(cfg)}
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /fetch", s.requireAuth(s.handleFetchGet))
 	s.mux.HandleFunc("POST /fetch", s.requireAuth(s.handleFetchPost))
 	return s
 }
 
+// retryPolicy returns the server's policy (tests override sleep/jitter).
+func (s *Server) retryPolicy() retryPolicy { return s.retry }
 func (s *Server) clientFor(timeout time.Duration) *http.Client {
 	transport := &http.Transport{
 		DialContext:           guardedDialer(s.cfg.AllowPrivate, timeout),
@@ -164,16 +166,66 @@ func (s *Server) serveFetch(w http.ResponseWriter, r *http.Request, req fetchReq
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	upReq, err := http.NewRequestWithContext(ctx, method, target.String(), nil)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, errBadRequest, "invalid url")
+	policy := s.retryPolicy()
+	client := s.clientFor(timeout)
+	var resp *http.Response
+	var err error
+	var lastErr error
+	attempts := 0
+	var waited time.Duration
+	for {
+		attempts++
+		resp, err = client.Do(buildUpstreamRequest(ctx, s.cfg, method, target, req.Headers))
+		lastErr = err
+		if err != nil {
+			if attempts-1 < policy.maxRetries && retryableError(err) && r.Context().Err() == nil {
+				delay := policy.backoff(attempts)
+				if waited+delay > policy.budget {
+					break
+				}
+				if !policy.sleep(ctx, delay) {
+					s.writeUpstreamError(w, target, err)
+					return
+				}
+				waited += delay
+				s.log.Info("retrying after transport error",
+					"url", redactURL(target), "attempt", attempts, "error", firstLine(err.Error()))
+				continue
+			}
+			s.writeUpstreamError(w, target, err)
+			return
+		}
+		if attempts-1 < policy.maxRetries && retryableStatus(resp.StatusCode) && r.Context().Err() == nil {
+			proceed, slept := policy.waitBeforeRetry(ctx, resp, attempts, waited)
+			if proceed {
+				waited += slept
+				drainAndClose(resp.Body)
+				s.log.Info("retrying after upstream status",
+					"url", redactURL(target), "attempt", attempts, "status", resp.StatusCode)
+				continue
+			}
+		}
+		break
+	}
+	if resp == nil {
+		s.writeUpstreamError(w, target, lastErr)
 		return
 	}
-	if s.cfg.UserAgent != "" {
-		upReq.Header.Set("User-Agent", s.cfg.UserAgent)
+	s.streamUpstream(w, target, resp, attempts)
+}
+
+// buildUpstreamRequest constructs one attempt's request.
+func buildUpstreamRequest(ctx context.Context, cfg Config, method string, target *url.URL, headers map[string]string) *http.Request {
+	upReq, err := http.NewRequestWithContext(ctx, method, target.String(), nil)
+	if err != nil {
+		// Target was validated by parseFetchTarget; unreachable in practice.
+		upReq, _ = http.NewRequestWithContext(ctx, method, "http://invalid/", nil)
+	}
+	if cfg.UserAgent != "" {
+		upReq.Header.Set("User-Agent", cfg.UserAgent)
 	}
 	upReq.Header.Set("Accept-Encoding", "gzip")
-	for k, v := range req.Headers {
+	for k, v := range headers {
 		if strings.TrimSpace(v) == "" {
 			continue
 		}
@@ -183,12 +235,12 @@ func (s *Server) serveFetch(w http.ResponseWriter, r *http.Request, req fetchReq
 		}
 		upReq.Header.Set(k, v)
 	}
+	return upReq
+}
 
-	resp, err := s.clientFor(timeout).Do(upReq)
-	if err != nil {
-		s.writeUpstreamError(w, target, err)
-		return
-	}
+// streamUpstream sends the final upstream response: size gate, header
+// forwarding, and body streaming with truncation at the limit.
+func (s *Server) streamUpstream(w http.ResponseWriter, target *url.URL, resp *http.Response, attempts int) {
 	defer resp.Body.Close()
 
 	gzipped := strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip")
@@ -218,7 +270,7 @@ func (s *Server) serveFetch(w http.ResponseWriter, r *http.Request, req fetchReq
 		}
 	}
 	w.Header().Set("X-Fetchd-Final-URL", resp.Request.URL.String())
-	w.Header().Set("X-Fetchd-Attempts", "1")
+	w.Header().Set("X-Fetchd-Attempts", strconv.Itoa(attempts))
 	w.Header().Set("X-Fetchd-Upstream-Status", strconv.Itoa(resp.StatusCode))
 	w.WriteHeader(resp.StatusCode)
 
@@ -230,6 +282,14 @@ func (s *Server) serveFetch(w http.ResponseWriter, r *http.Request, req fetchReq
 	if limited.N <= 0 {
 		s.log.Warn("upstream body exceeded limit; stream truncated",
 			"url", redactURL(target), "limit", s.cfg.MaxBodyBytes)
+	}
+}
+
+// drainAndClose frees a retryable response's connection for reuse.
+func drainAndClose(body io.Reader) {
+	if c, ok := body.(io.Closer); ok {
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, 256<<10))
+		_ = c.Close()
 	}
 }
 
